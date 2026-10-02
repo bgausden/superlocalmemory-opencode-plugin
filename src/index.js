@@ -11,7 +11,6 @@ import { relative } from "node:path";
 
 const execFileAsync = promisify(execFile);
 
-const SLM_BIN = process.env.SLM_BIN || "slm";
 const CTX_TIMEOUT_MS = 8000;
 const REMEMBER_TIMEOUT_MS = 8000;
 const MAX_CTX_CHARS = Number(process.env.SLM_MAX_CTX_CHARS) || 1500;
@@ -120,15 +119,37 @@ export const retrieval = {
   },
 };
 
-async function runSlm(args, { timeout = CTX_TIMEOUT_MS } = {}) {
+// --- slm gateway errors (tagged, explicit fail-open) ---
+// Every slm subprocess failure is classified, never swallowed to "". Callers
+// check `ok` and degrade deliberately — the shape an Effect migration would
+// lift into the error channel (Effect<A, SliError>) and close with catchAll
+// at the boundary, as the effect flavor's `Effect<void, never, R>` requires.
+const slmBin = () => process.env.SLM_BIN || "slm";
+
+export function classifySlmError(err, { timeout = CTX_TIMEOUT_MS } = {}) {
+  if (isRecord(err) && (err.killed || err.signal === "SIGTERM")) {
+    return { tag: "timeout", timeoutMs: timeout };
+  }
+  if (isRecord(err) && (err.code === "ENOENT" || err.code === "EACCES")) {
+    return { tag: "spawn", code: err.code };
+  }
+  if (isRecord(err) && (typeof err.code === "number" || typeof err.signal === "string")) {
+    const stderr =
+      typeof err.stderr === "string" ? err.stderr.trim().slice(0, 500) : "";
+    return { tag: "exit", code: err.code ?? err.signal, stderr };
+  }
+  return { tag: "unknown" };
+}
+
+async function runSlmStrict(args, { timeout = CTX_TIMEOUT_MS } = {}) {
   try {
-    const { stdout } = await execFileAsync(SLM_BIN, args, {
+    const { stdout } = await execFileAsync(slmBin(), args, {
       timeout,
       maxBuffer: 256 * 1024,
     });
-    return (stdout || "").trim();
-  } catch {
-    return "";
+    return { ok: true, stdout: (stdout || "").trim() };
+  } catch (err) {
+    return { ok: false, error: classifySlmError(err, { timeout }) };
   }
 }
 
@@ -140,8 +161,11 @@ function truncate(s, max = MAX_CTX_CHARS) {
 
 async function sessionContext(query, max = MAX_CTX_CHARS) {
   const q = (query || "").slice(0, 500) || "general";
-  const out = await runSlm(["session-context", q], { timeout: CTX_TIMEOUT_MS });
-  return truncate(out, max);
+  const r = await runSlmStrict(["session-context", q], { timeout: CTX_TIMEOUT_MS });
+  // Explicit fail-open: no memories and a dead binary both yield no context,
+  // but the distinction survives in `error` for callers that care.
+  if (!r.ok) return { ok: false, text: "", error: r.error };
+  return { ok: true, text: truncate(r.stdout, max), error: undefined };
 }
 
 // Short guard window: session.idle and session.status/idle both fire for
@@ -173,11 +197,14 @@ export function isSessionEndEvent(event) {
 export { patchPaths };
 
 // Fire-and-forget remember; never await in hot path longer than timeout.
+// Explicit fail-open: a failed write is dropped on purpose, not lost in a
+// swallowed empty string.
 async function remember(content, tags = "opencode-hook") {
   if (!content?.trim()) return;
-  await runSlm(["remember", "--tags", tags, content.slice(0, 2000)], {
+  const r = await runSlmStrict(["remember", "--tags", tags, content.slice(0, 2000)], {
     timeout: REMEMBER_TIMEOUT_MS,
   });
+  if (!r.ok) return;
 }
 
 // --- touch log + end summary (single seam, rollup) ---
@@ -272,10 +299,10 @@ export default Plugin.define({
         const key = sessionID || text.slice(0, 64) || "unknown";
         const isFirst = firstSeen.claim(key);
 
-        const slmCtx = await sessionContext(text);
-        if (slmCtx) {
+        const r = await sessionContext(text);
+        if (r.ok && r.text) {
           additions.push(
-            `<slm-memory status="background">\nFor model use only; do not quote verbatim unless directly relevant.\n\n${slmCtx}\n</slm-memory>`
+            `<slm-memory status="background">\nFor model use only; do not quote verbatim unless directly relevant.\n\n${r.text}\n</slm-memory>`
           );
         }
         if (isFirst) {
@@ -312,10 +339,10 @@ export default Plugin.define({
     // V1 was "experimental.session.compacting"; V2 is session "compaction".
     await ctx.session.hook("compaction", async (event) => {
       try {
-        const slmCtx = await sessionContext(projectName, MAX_COMPACT_CTX_CHARS);
-        if (!slmCtx) return;
+        const r = await sessionContext(projectName, MAX_COMPACT_CTX_CHARS);
+        if (!r.ok || !r.text) return;
         const prompt =
-          `[SESSION COMPACTION — SLM PROJECT KNOWLEDGE]\nPreserve task status, decisions, files touched, and blockers.\n\n${slmCtx}`;
+          `[SESSION COMPACTION — SLM PROJECT KNOWLEDGE]\nPreserve task status, decisions, files touched, and blockers.\n\n${r.text}`;
         if (Array.isArray(event?.system)) {
           event.system.push({ type: "text", text: prompt });
         }

@@ -172,3 +172,22 @@ describe("formatEndSummary", () => {
     assert.equal(s, "[p] opencode session ended t");
   });
 });
+
+describe("classifySlmError", () => {
+  it("tags timeouts, spawn failures, exits, and unknowns", async () => {
+    const { classifySlmError } = await import("../src/index.js");
+    assert.deepEqual(classifySlmError({ killed: true }, { timeout: 5 }), {
+      tag: "timeout",
+      timeoutMs: 5,
+    });
+    assert.deepEqual(classifySlmError({ code: "ENOENT" }), {
+      tag: "spawn",
+      code: "ENOENT",
+    });
+    assert.deepEqual(
+      classifySlmError({ code: 1, stderr: "  boom  " }),
+      { tag: "exit", code: 1, stderr: "boom" }
+    );
+    assert.deepEqual(classifySlmError(null), { tag: "unknown" });
+  });
+});
