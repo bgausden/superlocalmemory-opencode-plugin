@@ -7,10 +7,9 @@
 import { Plugin } from "@opencode/plugin";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { createHash } from "node:crypto";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir, } from "node:os";
+import { join, relative } from "node:path";
+import { appendFileSync } from "node:fs";
 
 const execFileAsync = promisify(execFile);
 
@@ -19,7 +18,6 @@ const CTX_TIMEOUT_MS = 8000;
 const REMEMBER_TIMEOUT_MS = 8000;
 const MAX_CTX_CHARS = Number(process.env.SLM_MAX_CTX_CHARS) || 1500;
 const MAX_COMPACT_CTX_CHARS = 4000;
-const OBSERVE_COOLDOWN_MS = 5 * 60 * 1000;
 
 const MEMORY_KEYWORDS = /\b(remember|don't forget|save this|note that|keep in mind|store this|memorize)\b/i;
 
@@ -148,27 +146,6 @@ async function sessionContext(query, max = MAX_CTX_CHARS) {
   return truncate(out, max);
 }
 
-function cooldownPath(key) {
-  const h = createHash("sha256").update(key).digest("hex").slice(0, 16);
-  return join(tmpdir(), `slm-opencode-obs-${h}`);
-}
-
-function cooldownElapsed(path, cooldownMs) {
-  try {
-    if (!existsSync(path)) return true;
-    const ts = Number(readFileSync(path, "utf8").trim());
-    return Date.now() - ts > cooldownMs;
-  } catch {
-    return true;
-  }
-}
-
-function markCooldown(path) {
-  try {
-    writeFileSync(path, String(Date.now()));
-  } catch {}
-}
-
 // Short guard window: session.idle and session.status/idle both fire for
 // the same turn (~simultaneously), while real turns are model round-trips
 // apart. session.compacted is live (session-compaction-event) and counts as
@@ -193,6 +170,61 @@ async function remember(content, tags = "opencode-hook") {
   await runSlm(["remember", "--tags", tags, content.slice(0, 2000)], {
     timeout: REMEMBER_TIMEOUT_MS,
   });
+}
+
+// --- touch log + end summary (single seam, rollup) ---
+// The tool hook only accumulates touched paths per session; one enriched
+// summary is written per idle turn. Both halves are pure and exported so
+// hook logic stays testable.
+export function createTouchLog() {
+  const touched = new Map();
+  return {
+    touch(key, paths) {
+      if (!key || !Array.isArray(paths)) return;
+      let list = touched.get(key);
+      if (!list) {
+        list = [];
+        touched.set(key, list);
+      }
+      for (const p of paths) {
+        if (p && !list.includes(p)) list.push(p);
+      }
+    },
+    take(key) {
+      const list = touched.get(key) || [];
+      touched.delete(key);
+      return list;
+    },
+  };
+}
+
+const MAX_SUMMARY_FILES = 20;
+const MAX_COMMIT_SUBJECT = 100;
+
+function localTimestamp(d = new Date()) {
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+// Fields ordered by recall value — remember() slices at 2000 chars, so the
+// most expendable (recent commits) goes last.
+export function formatEndSummary({ projectName, at, branch, files, diff, sessionID, commits }) {
+  const lines = [`[${projectName}] opencode session ended ${at}`];
+  if (branch) lines.push(`branch: ${branch}`);
+  if (files.length > 0) {
+    const shown = files.slice(0, MAX_SUMMARY_FILES);
+    lines.push(
+      files.length > shown.length
+        ? `files: ${shown.length} of ${files.length}: ${shown.join(", ")}`
+        : `files: ${shown.join(", ")}`
+    );
+  }
+  if (diff) lines.push(`uncommitted: ${diff}`);
+  if (sessionID) lines.push(`session: ${sessionID}`);
+  for (const c of commits.slice(0, 5)) {
+    lines.push(`recent: ${c.slice(0, MAX_COMMIT_SUBJECT)}`);
+  }
+  return lines.join(" | ");
 }
 
 export default Plugin.define({
@@ -250,30 +282,21 @@ export default Plugin.define({
       } catch {}
     });
 
-    // File-change observer: only completed writes count. edit/write/patch
-    // are the mutating tools; read/glob/grep carry paths but change nothing
-    // and failed calls (status error) changed nothing either. One remember
-    // per event, however many paths a patch touches.
+    // File-touch bookkeeping only: accumulate project-relative paths per
+    // session for the end-of-turn summary. Zero subprocesses here.
+    const touches = createTouchLog();
     await ctx.tool.hook("execute.after", async (event) => {
       try {
         if (event?.status !== "completed") return;
         const tool = String(event?.tool || "").toLowerCase();
         if (!/^(edit|write|patch)$/.test(tool)) return;
-        const fresh = retrieval
-          .filePaths(event?.input)
-          .filter((fp) => {
-            const cdPath = cooldownPath(`file:${fp}`);
-            if (!cooldownElapsed(cdPath, OBSERVE_COOLDOWN_MS)) return false;
-            markCooldown(cdPath);
-            return true;
-          })
-          .slice(0, 10);
-        if (fresh.length === 0) return;
-        const shown =
-          fresh.length === 1
-            ? `${fresh[0].split(/[\\/]/).filter(Boolean).pop() ?? fresh[0]} (${fresh[0]})`
-            : `${fresh.length} files: ${fresh.join(", ")}`;
-        remember(`File changed: ${shown}`, "hook-file-change,opencode").catch(() => {});
+        if (!event?.sessionID) return;
+        const rel = [];
+        for (const fp of retrieval.filePaths(event?.input)) {
+          const r = relative(projectDir, fp);
+          rel.push(r && !r.startsWith("..") ? r : fp);
+        }
+        touches.touch(event.sessionID, rel);
       } catch {}
     });
 
@@ -302,16 +325,25 @@ export default Plugin.define({
       try {
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
           try {
+            // TEMPORARY flush-path verification: log every received event.
+            try {
+              appendFileSync(
+                join(tmpdir(), "slm-memory-events.log"),
+                `${new Date().toISOString()} ${event?.type}\n`
+              );
+            } catch {}
             if (!isSessionEndEvent(event)) continue;
             const sessionID = retrieval.sessionID(event);
             const key = sessionID || projectDir;
             const last = endSummaries.get(key) || 0;
             if (Date.now() - last < END_SUMMARY_DEDUPE_MS) continue;
             if (endSummaries.size > 100) endSummaries.clear();
+            const files = touches.take(sessionID || "");
             let branch = "";
             let diff = "";
+            let log = [];
             try {
-              const [b, d] = await Promise.all([
+              const [b, d, l] = await Promise.all([
                 execFileAsync("git", ["-C", projectDir, "branch", "--show-current"], {
                   timeout: 5000,
                 })
@@ -320,16 +352,29 @@ export default Plugin.define({
                 execFileAsync("git", ["-C", projectDir, "diff", "--stat"], { timeout: 5000 })
                   .then((r) => (r.stdout || "").trim().split("\n").pop() || "")
                   .catch(() => ""),
+                execFileAsync(
+                  "git",
+                  ["-C", projectDir, "log", "--oneline", "-5", "--since=3 hours ago"],
+                  { timeout: 5000 }
+                )
+                  .then((r) => (r.stdout || "").trim().split("\n").filter(Boolean))
+                  .catch(() => []),
               ]);
               branch = b;
               diff = d;
+              log = l;
             } catch {}
-            const parts = [`[${projectName}] opencode session ended`];
-            if (branch) parts.push(`branch: ${branch}`);
-            if (diff) parts.push(`uncommitted: ${diff}`);
-            if (sessionID) parts.push(`session: ${sessionID}`);
+            const summary = formatEndSummary({
+              projectName,
+              at: localTimestamp(),
+              branch,
+              files,
+              diff,
+              sessionID,
+              commits: log,
+            });
             endSummaries.set(key, Date.now());
-            remember(parts.join(" | "), "opencode-session-stop").catch(() => {});
+            remember(summary, "opencode-session-stop").catch(() => {});
           } catch {}
         }
       } catch {}

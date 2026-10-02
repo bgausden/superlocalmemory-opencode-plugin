@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { retrieval, patchPaths, isSessionEndEvent } from "../src/index.js";
+import { retrieval, patchPaths, isSessionEndEvent, createTouchLog, formatEndSummary } from "../src/index.js";
 
 describe("retrieval.text", () => {
   it("returns the last user message, skipping system/assistant/tool", () => {
@@ -113,5 +113,53 @@ describe("isSessionEndEvent", () => {
       false
     );
     assert.equal(isSessionEndEvent({ type: "session.created" }), false);
+  });
+});
+
+describe("createTouchLog", () => {
+  it("dedupes and keeps insertion order, take clears", () => {
+    const log = createTouchLog();
+    log.touch("s1", ["b.ts", "a.ts"]);
+    log.touch("s1", ["a.ts", "c.ts"]);
+    log.touch("s2", ["z.ts"]);
+    assert.deepEqual(log.take("s1"), ["b.ts", "a.ts", "c.ts"]);
+    assert.deepEqual(log.take("s1"), []);
+    assert.deepEqual(log.take("s2"), ["z.ts"]);
+    assert.deepEqual(log.take("missing"), []);
+  });
+});
+
+describe("formatEndSummary", () => {
+  it("orders fields by value and caps files at 20 of N", () => {
+    const files = Array.from({ length: 25 }, (_, i) => `f${i}.ts`);
+    const s = formatEndSummary({
+      projectName: "p",
+      at: "2026-10-02 20:00",
+      branch: "main",
+      files,
+      diff: "3 files changed",
+      sessionID: "ses_1",
+      commits: ["abc subject"],
+    });
+    assert.match(s, /^\[p\] opencode session ended 2026-10-02 20:00/);
+    assert.match(s, /branch: main/);
+    assert.match(s, /files: 20 of 25: f0\.ts/);
+    assert.ok(!s.includes("f24.ts"));
+    assert.match(s, /uncommitted: 3 files changed/);
+    assert.match(s, /session: ses_1/);
+    assert.match(s, /recent: abc subject/);
+  });
+
+  it("omits empty sections", () => {
+    const s = formatEndSummary({
+      projectName: "p",
+      at: "t",
+      branch: "",
+      files: [],
+      diff: "",
+      sessionID: undefined,
+      commits: [],
+    });
+    assert.equal(s, "[p] opencode session ended t");
   });
 });
