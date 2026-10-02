@@ -30,6 +30,6 @@ Requires `@opencode/plugin 2.0.22` (see `package.json`) and `slm` on
 ## Behaviour
 
 - `session.context` hook: keyword nudge + `slm session-context` + first-message init hint into `event.system` (model-only background, not echoed as user text).
-- `tool.execute.after` hook: cooldown-gated `slm remember` on file edits.
+- `tool.execute.after` hook: touch bookkeeping only — accumulates project-relative paths per session, zero subprocesses.
 - `session.compaction` hook: inject SLM project knowledge into compaction.
-- `event.subscribe`: session end summary via `slm remember` with git branch/diff.
+- `event.subscribe`: one enriched per-turn summary (`slm remember`, tag `opencode-session-stop`) on `session.execution.succeeded/failed/interrupted` — timestamp, branch, touched files (20 of N), diff-stat, recent commits. `session.idle/status/compacted` kept as fallback.

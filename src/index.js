@@ -7,9 +7,7 @@
 import { Plugin } from "@opencode/plugin";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { tmpdir, } from "node:os";
-import { join, relative } from "node:path";
-import { appendFileSync } from "node:fs";
+import { relative } from "node:path";
 
 const execFileAsync = promisify(execFile);
 
@@ -335,13 +333,6 @@ export default Plugin.define({
       try {
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
           try {
-            // TEMPORARY flush-path verification: log every received event.
-            try {
-              appendFileSync(
-                join(tmpdir(), "slm-memory-events.log"),
-                `${new Date().toISOString()} ${event?.type}\n`
-              );
-            } catch {}
             if (!isSessionEndEvent(event)) continue;
             const sessionID = retrieval.sessionID(event);
             const key = sessionID || projectDir;
