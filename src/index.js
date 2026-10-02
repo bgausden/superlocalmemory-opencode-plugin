@@ -57,55 +57,81 @@ function messageText(m) {
 }
 
 function lastUserText(messages) {
+  // Latest user-role message wins, even when it carries no text (e.g. a
+  // media-only message). Falling back to an older message would feed a stale
+  // query to session-context, so a textless latest message means "" (skip
+  // recall this turn) rather than a stale question. Non-user roles are still
+  // skipped so mid-loop tool continuations reuse the triggering question.
   if (!Array.isArray(messages)) return "";
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     if (!isRecord(m)) continue;
     if (m.role && m.role !== "user") continue;
-    const text = messageText(m);
-    if (text) return text;
+    return messageText(m);
   }
   return "";
 }
 
+function patchPaths(patchText) {
+  // patch tool embeds target paths in section headers:
+  // *** Add File: <path> / *** Update File: <path>
+  if (typeof patchText !== "string") return [];
+  const out = [];
+  for (const line of patchText.split("\n")) {
+    const m = /^\*\*\* (?:Add|Update) File:\s*(.+?)\s*$/.exec(line);
+    if (m) out.push(m[1]);
+  }
+  return out;
+}
+
 export const retrieval = {
-  // Conversation text for the context hook: last user message, else a
-  // direct text payload. V1 envelope probes (properties/event/message/parts)
-  // deleted — the live SessionContext event carries messages/system.
+  // Conversation text for the context hook: latest user message text.
+  // Live SessionContext carries messages/system; no other producer exists
+  // since the prompt hook was dropped, so no direct-payload fallback.
   text(payload) {
     if (!isRecord(payload)) return "";
-    const fromMessages = lastUserText(payload.messages);
-    if (fromMessages) return fromMessages;
-    const c = payload;
-    const values = [c.prompt?.text, c.text, c.prompt, c.content];
-    return values.map(readString).find(Boolean) ?? "";
+    return lastUserText(payload.messages);
   },
   // Session identity for context + subscribe events. Live shapes carry
-  // sessionID directly or under data; V1 properties/path probes deleted.
+  // sessionID top-level (hooks) or under data (events); || skips empties.
   sessionID(payload) {
     if (!isRecord(payload)) return undefined;
-    return payload.sessionID ?? payload.sessionId ?? payload.data?.sessionID;
+    return payload.sessionID || payload.data?.sessionID || undefined;
   },
-  // File path from tool input. Live shape is the direct args object;
-  // V1 properties/event nesting deleted.
-  filePath(input) {
-    if (!isRecord(input)) return "";
-    const candidates = [
-      input?.filePath,
-      input?.path,
-      input?.file_path,
-      input?.args?.filePath,
-      input?.args?.path,
-    ];
-    for (const c of candidates) {
-      if (typeof c === "string" && c.trim()) return c.trim();
-    }
+  // Every file path a tool input touches. Live shapes: path (edit/write),
+  // filePaths[] (multi-file read), patchText-embedded paths (patch).
+  // Legacy filePath/file_path spellings kept — the rename is recent.
+  filePaths(input) {
+    if (!isRecord(input)) return [];
+    const out = [];
+    const push = (v) => {
+      if (typeof v === "string" && v.trim()) out.push(v.trim());
+    };
+    const pushAll = (v) => {
+      if (Array.isArray(v)) v.forEach(push);
+      else push(v);
+    };
+    pushAll(input.filePaths);
+    push(input.path);
+    push(input.filePath);
+    push(input.file_path);
+    pushAll(input.args?.filePaths);
+    push(input.args?.path);
+    push(input.args?.filePath);
+    for (const p of patchPaths(input.patchText)) push(p);
+    for (const p of patchPaths(input.args?.patchText)) push(p);
     const nested = input?.tool_input;
     if (isRecord(nested)) {
-      const fp = nested.file_path || nested.filePath || nested.path;
-      if (typeof fp === "string" && fp.trim()) return fp.trim();
+      pushAll(nested.filePaths);
+      push(nested.path);
+      push(nested.filePath);
+      push(nested.file_path);
     }
-    return "";
+    return [...new Set(out)];
+  },
+  // First touched path, for single-path call sites.
+  filePath(input) {
+    return retrieval.filePaths(input)[0] ?? "";
   },
 };
 
@@ -154,15 +180,16 @@ function markCooldown(path) {
   } catch {}
 }
 
+const END_SUMMARY_DEDUPE_MS = 30 * 60 * 1000;
+
 function isSessionEndEvent(event) {
+  // Live V2 union: session.idle and session.status/idle BOTH fire per idle
+  // turn, so callers must dedupe (see endSummaries). session.compacted is
+  // not a live type (live: session.compaction.started|ended|failed).
   if (!isRecord(event)) return false;
-  const t = event.type;
-  if (t === "session.idle" || t === "session.compacted") return true; // V1 names
-  if (t === "session.compacted" && event?.data?.sessionID) return true;
-  if (t === "session.status" && event?.data?.status?.type === "idle") return true;
-  if (t === "session.status" && event?.data?.sessionID) {
-    // Only treat idle as end; busy/retry are not ends.
-    return event.data.status?.type === "idle";
+  if (event.type === "session.idle") return true;
+  if (event.type === "session.status") {
+    return event.data?.status?.type === "idle";
   }
   return false;
 }
@@ -230,18 +257,20 @@ export default Plugin.define({
       } catch {}
     });
 
-    // Mirrors Claude PostToolUse checkpoint: cooldown-gated auto-observe.
+    // File touches gate on path presence, not tool name: any tool carrying
+    // path(s) — edit/write/read/patch — is observable. patch embeds targets
+    // in patchText; multi-file read carries filePaths[].
     await ctx.tool.hook("execute.after", async (event) => {
       try {
-        const tool = String(event?.tool || "").toLowerCase();
-        const fp = retrieval.filePath(event?.input);
-        if (!/(edit|write|create|apply_patch)/.test(tool) && !fp) return;
-        if (!fp) return;
-        const basename = fp.split("/").pop();
-        const cdPath = cooldownPath(`file:${fp}`);
-        if (!cooldownElapsed(cdPath, OBSERVE_COOLDOWN_MS)) return;
-        markCooldown(cdPath);
-        remember(`File changed: ${basename} (${fp})`, "hook-file-change,opencode").catch(() => {});
+        const fps = retrieval.filePaths(event?.input);
+        if (fps.length === 0) return;
+        for (const fp of fps) {
+          const basename = fp.split(/[\\/]/).pop();
+          const cdPath = cooldownPath(`file:${fp}`);
+          if (!cooldownElapsed(cdPath, OBSERVE_COOLDOWN_MS)) continue;
+          markCooldown(cdPath);
+          remember(`File changed: ${basename} (${fp})`, "hook-file-change,opencode").catch(() => {});
+        }
       } catch {}
     });
 
@@ -260,7 +289,9 @@ export default Plugin.define({
     });
 
     // Session end -> rich summary (mirrors Claude `slm hook stop`).
-    // V1 was `event` hook; V2 is ctx.event.subscribe().
+    // V2 is ctx.event.subscribe(). session.idle and session.status/idle both
+    // fire per idle turn, so summaries are deduped per session + window.
+    const endSummaries = new Map();
     const controller = new AbortController();
     void (async () => {
       try {
@@ -268,6 +299,10 @@ export default Plugin.define({
           try {
             if (!isSessionEndEvent(event)) continue;
             const sessionID = retrieval.sessionID(event);
+            const key = sessionID || projectDir;
+            const last = endSummaries.get(key) || 0;
+            if (Date.now() - last < END_SUMMARY_DEDUPE_MS) continue;
+            endSummaries.set(key, Date.now());
             let branch = "";
             let diff = "";
             try {
