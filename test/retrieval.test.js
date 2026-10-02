@@ -96,7 +96,16 @@ describe("patchPaths", () => {
 
 describe("isSessionEndEvent", () => {
   it("matches live end signals only", () => {
-    assert.equal(isSessionEndEvent({ type: "session.idle" }), true);
+    assert.equal(
+      isSessionEndEvent({ type: "session.execution.succeeded" }),
+      true
+    );
+    assert.equal(isSessionEndEvent({ type: "session.execution.failed" }), true);
+    assert.equal(
+      isSessionEndEvent({ type: "session.execution.interrupted" }),
+      true
+    );
+    assert.equal(isSessionEndEvent({ type: "session.execution.started" }), false);
     assert.equal(isSessionEndEvent({ type: "session.compacted" }), true);
     assert.equal(
       isSessionEndEvent({

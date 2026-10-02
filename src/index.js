@@ -153,7 +153,17 @@ async function sessionContext(query, max = MAX_CTX_CHARS) {
 const END_SUMMARY_DEDUPE_MS = 5000;
 
 export function isSessionEndEvent(event) {
+  // Live turn-end signals are session.execution.succeeded/failed/interrupted
+  // (data.sessionID, durable). The session.idle/status/compacted members of
+  // the V2Event union are kept as fallback — this server's stream has only
+  // been observed to emit the execution.* family.
   if (!isRecord(event)) return false;
+  if (
+    event.type === "session.execution.succeeded" ||
+    event.type === "session.execution.failed" ||
+    event.type === "session.execution.interrupted"
+  )
+    return true;
   if (event.type === "session.idle") return true;
   if (event.type === "session.compacted") return true;
   if (event.type === "session.status") {
