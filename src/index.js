@@ -17,7 +17,8 @@ const execFileAsync = promisify(execFile);
 const SLM_BIN = process.env.SLM_BIN || "slm";
 const CTX_TIMEOUT_MS = 8000;
 const REMEMBER_TIMEOUT_MS = 8000;
-const MAX_CTX_CHARS = 4000;
+const MAX_CTX_CHARS = Number(process.env.SLM_MAX_CTX_CHARS) || 1500;
+const MAX_COMPACT_CTX_CHARS = 4000;
 const OBSERVE_COOLDOWN_MS = 5 * 60 * 1000;
 
 const MEMORY_KEYWORDS = /\b(remember|don't forget|save this|note that|keep in mind|store this|memorize)\b/i;
@@ -122,10 +123,40 @@ function truncate(s, max = MAX_CTX_CHARS) {
   return s.slice(0, max) + `\n…[truncated ${s.length - max} chars]`;
 }
 
-async function sessionContext(query) {
+function extractMessageText(m) {
+  if (!isRecord(m)) return "";
+  const c = m.content ?? m.parts ?? m.text;
+  if (typeof c === "string") return c.trim();
+  if (Array.isArray(c)) {
+    return c
+      .map((p) => {
+        if (typeof p === "string") return p;
+        if (isRecord(p) && typeof p.text === "string") return p.text;
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+  }
+  return "";
+}
+
+export function extractLastUserText(messages) {
+  if (!Array.isArray(messages)) return "";
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!isRecord(m)) continue;
+    if (m.role && m.role !== "user") continue;
+    const text = extractMessageText(m);
+    if (text) return text;
+  }
+  return "";
+}
+
+async function sessionContext(query, max = MAX_CTX_CHARS) {
   const q = (query || "").slice(0, 500) || "general";
   const out = await runSlm(["session-context", q], { timeout: CTX_TIMEOUT_MS });
-  return truncate(out);
+  return truncate(out, max);
 }
 
 function cooldownPath(key) {
@@ -212,11 +243,24 @@ export default Plugin.define({
       String(projectDir).split("/").filter(Boolean).pop() || "general";
     const injectedSessions = new Set();
 
-    // Mirrors Claude UserPromptSubmit: inject SLM context + keyword nudge.
-    // V1 was "tui.prompt.append"; V2 is session "prompt" hook.
+    // Prompt hook stays lightweight on purpose: the recalled SLM text is NOT
+    // appended to event.prompt.text anymore (that echoes prominently as the
+    // user's own message and is persisted). It only tracks first-seen
+    // sessions; the actual recall is injected via the "context" hook below
+    // into event.system, which is model-only background like thinking output.
     await ctx.session.hook("prompt", async (event) => {
       try {
-        const text = readString(event?.prompt?.text) || extractPromptText(event);
+        const sessionID = event?.sessionID || resolveSessionID(event);
+        const key = sessionID || readString(event?.prompt?.text).slice(0, 64) || "unknown";
+        if (!injectedSessions.has(key)) injectedSessions.add(key);
+      } catch {}
+    });
+
+    // Background recall: model-only system context, not echoed as user text.
+    await ctx.session.hook("context", async (event) => {
+      try {
+        const text =
+          extractLastUserText(event?.messages) || extractPromptText(event);
         if (!text.trim()) return;
         const additions = [];
 
@@ -225,20 +269,24 @@ export default Plugin.define({
         }
 
         const sessionID = event?.sessionID || resolveSessionID(event);
-        const key = sessionID || event?.prompt?.text?.slice(0, 64) || "unknown";
+        const key = sessionID || text.slice(0, 64) || "unknown";
         const isFirst = !injectedSessions.has(key);
         if (isFirst) injectedSessions.add(key);
 
         const slmCtx = await sessionContext(text);
-        if (slmCtx) additions.push(slmCtx);
+        if (slmCtx) {
+          additions.push(
+            `<slm-memory status="background">\nFor model use only; do not quote verbatim unless directly relevant.\n\n${slmCtx}\n</slm-memory>`
+          );
+        }
         if (isFirst) {
           additions.push(
             `## SLM Session Init\nFor memory-aware sessions, call superlocalmemory MCP session_init with project_path='${projectDir}' and a topic from the user's first message.`
           );
         }
 
-        if (additions.length > 0 && event?.prompt && typeof event.prompt.text === "string") {
-          event.prompt.text = `${event.prompt.text}\n\n${additions.join("\n\n")}`;
+        if (additions.length > 0 && Array.isArray(event?.system)) {
+          event.system.push({ type: "text", text: additions.join("\n\n") });
         }
       } catch {}
     });
@@ -262,7 +310,7 @@ export default Plugin.define({
     // V1 was "experimental.session.compacting"; V2 is session "compaction".
     await ctx.session.hook("compaction", async (event) => {
       try {
-        const slmCtx = await sessionContext(projectName);
+        const slmCtx = await sessionContext(projectName, MAX_COMPACT_CTX_CHARS);
         if (!slmCtx) return;
         const prompt =
           `[SESSION COMPACTION — SLM PROJECT KNOWLEDGE]\nPreserve task status, decisions, files touched, and blockers.\n\n${slmCtx}`;
