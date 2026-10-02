@@ -34,13 +34,11 @@ function isRecord(v) {
   return typeof v === "object" && v !== null;
 }
 
-function readString(v) {
-  return typeof v === "string" ? v.trim() : "";
-}
-
 function messageText(m) {
+  // Live Message carries content: ContentPart[]. No parts/text probe —
+  // no producer sends those shapes.
   if (!isRecord(m)) return "";
-  const c = m.content ?? m.parts ?? m.text;
+  const c = m.content;
   if (typeof c === "string") return c.trim();
   if (Array.isArray(c)) {
     return c
@@ -73,13 +71,23 @@ function lastUserText(messages) {
 }
 
 function patchPaths(patchText) {
-  // patch tool embeds target paths in section headers:
-  // *** Add File: <path> / *** Update File: <path>
+  // patch tool embeds target paths in section headers (see @opencode/util
+  // patch.js): *** Add File: / *** Update File: / *** Delete File: plus
+  // *** Move to: for renames. Headers match on the trimmed line.
   if (typeof patchText !== "string") return [];
   const out = [];
-  for (const line of patchText.split("\n")) {
-    const m = /^\*\*\* (?:Add|Update) File:\s*(.+?)\s*$/.exec(line);
-    if (m) out.push(m[1]);
+  for (const raw of patchText.split("\n")) {
+    const line = raw.trim();
+    for (const prefix of ["*** Add File:", "*** Update File:", "*** Delete File:"]) {
+      if (line.startsWith(prefix)) {
+        const p = line.slice(prefix.length).trim();
+        if (p) out.push(p);
+      }
+    }
+    if (line.startsWith("*** Move to:")) {
+      const p = line.slice("*** Move to:".length).trim();
+      if (p) out.push(p);
+    }
   }
   return out;
 }
@@ -98,40 +106,21 @@ export const retrieval = {
     if (!isRecord(payload)) return undefined;
     return payload.sessionID || payload.data?.sessionID || undefined;
   },
-  // Every file path a tool input touches. Live shapes: path (edit/write),
-  // filePaths[] (multi-file read), patchText-embedded paths (patch).
-  // Legacy filePath/file_path spellings kept — the rename is recent.
+  // Every file path a tool input touches. Live shapes: path (read/write/
+  // edit) and patchText-embedded paths (patch: Add/Update/Delete/Move).
+  // filePath/file_path spellings kept for recent-rename and snake_case
+  // (MCP) producers. V1 args.*/tool_input.* nesting deleted — no producer.
   filePaths(input) {
     if (!isRecord(input)) return [];
     const out = [];
     const push = (v) => {
       if (typeof v === "string" && v.trim()) out.push(v.trim());
     };
-    const pushAll = (v) => {
-      if (Array.isArray(v)) v.forEach(push);
-      else push(v);
-    };
-    pushAll(input.filePaths);
     push(input.path);
     push(input.filePath);
     push(input.file_path);
-    pushAll(input.args?.filePaths);
-    push(input.args?.path);
-    push(input.args?.filePath);
     for (const p of patchPaths(input.patchText)) push(p);
-    for (const p of patchPaths(input.args?.patchText)) push(p);
-    const nested = input?.tool_input;
-    if (isRecord(nested)) {
-      pushAll(nested.filePaths);
-      push(nested.path);
-      push(nested.filePath);
-      push(nested.file_path);
-    }
     return [...new Set(out)];
-  },
-  // First touched path, for single-path call sites.
-  filePath(input) {
-    return retrieval.filePaths(input)[0] ?? "";
   },
 };
 
@@ -180,19 +169,23 @@ function markCooldown(path) {
   } catch {}
 }
 
-const END_SUMMARY_DEDUPE_MS = 30 * 60 * 1000;
+// Short guard window: session.idle and session.status/idle both fire for
+// the same turn (~simultaneously), while real turns are model round-trips
+// apart. session.compacted is live (session-compaction-event) and counts as
+// a milestone worth one summary.
+const END_SUMMARY_DEDUPE_MS = 5000;
 
-function isSessionEndEvent(event) {
-  // Live V2 union: session.idle and session.status/idle BOTH fire per idle
-  // turn, so callers must dedupe (see endSummaries). session.compacted is
-  // not a live type (live: session.compaction.started|ended|failed).
+export function isSessionEndEvent(event) {
   if (!isRecord(event)) return false;
   if (event.type === "session.idle") return true;
+  if (event.type === "session.compacted") return true;
   if (event.type === "session.status") {
     return event.data?.status?.type === "idle";
   }
   return false;
 }
+
+export { patchPaths };
 
 // Fire-and-forget remember; never await in hot path longer than timeout.
 async function remember(content, tags = "opencode-hook") {
@@ -257,20 +250,30 @@ export default Plugin.define({
       } catch {}
     });
 
-    // File touches gate on path presence, not tool name: any tool carrying
-    // path(s) — edit/write/read/patch — is observable. patch embeds targets
-    // in patchText; multi-file read carries filePaths[].
+    // File-change observer: only completed writes count. edit/write/patch
+    // are the mutating tools; read/glob/grep carry paths but change nothing
+    // and failed calls (status error) changed nothing either. One remember
+    // per event, however many paths a patch touches.
     await ctx.tool.hook("execute.after", async (event) => {
       try {
-        const fps = retrieval.filePaths(event?.input);
-        if (fps.length === 0) return;
-        for (const fp of fps) {
-          const basename = fp.split(/[\\/]/).pop();
-          const cdPath = cooldownPath(`file:${fp}`);
-          if (!cooldownElapsed(cdPath, OBSERVE_COOLDOWN_MS)) continue;
-          markCooldown(cdPath);
-          remember(`File changed: ${basename} (${fp})`, "hook-file-change,opencode").catch(() => {});
-        }
+        if (event?.status !== "completed") return;
+        const tool = String(event?.tool || "").toLowerCase();
+        if (!/^(edit|write|patch)$/.test(tool)) return;
+        const fresh = retrieval
+          .filePaths(event?.input)
+          .filter((fp) => {
+            const cdPath = cooldownPath(`file:${fp}`);
+            if (!cooldownElapsed(cdPath, OBSERVE_COOLDOWN_MS)) return false;
+            markCooldown(cdPath);
+            return true;
+          })
+          .slice(0, 10);
+        if (fresh.length === 0) return;
+        const shown =
+          fresh.length === 1
+            ? `${fresh[0].split(/[\\/]/).filter(Boolean).pop() ?? fresh[0]} (${fresh[0]})`
+            : `${fresh.length} files: ${fresh.join(", ")}`;
+        remember(`File changed: ${shown}`, "hook-file-change,opencode").catch(() => {});
       } catch {}
     });
 
@@ -290,7 +293,9 @@ export default Plugin.define({
 
     // Session end -> rich summary (mirrors Claude `slm hook stop`).
     // V2 is ctx.event.subscribe(). session.idle and session.status/idle both
-    // fire per idle turn, so summaries are deduped per session + window.
+    // fire for the same turn, so the short guard window collapses the
+    // duplicate while real turns (model round-trips apart) pass through.
+    // Pruned on write: one entry per recently-ended session.
     const endSummaries = new Map();
     const controller = new AbortController();
     void (async () => {
@@ -302,7 +307,7 @@ export default Plugin.define({
             const key = sessionID || projectDir;
             const last = endSummaries.get(key) || 0;
             if (Date.now() - last < END_SUMMARY_DEDUPE_MS) continue;
-            endSummaries.set(key, Date.now());
+            if (endSummaries.size > 100) endSummaries.clear();
             let branch = "";
             let diff = "";
             try {
@@ -323,6 +328,7 @@ export default Plugin.define({
             if (branch) parts.push(`branch: ${branch}`);
             if (diff) parts.push(`uncommitted: ${diff}`);
             if (sessionID) parts.push(`session: ${sessionID}`);
+            endSummaries.set(key, Date.now());
             remember(parts.join(" | "), "opencode-session-stop").catch(() => {});
           } catch {}
         }
