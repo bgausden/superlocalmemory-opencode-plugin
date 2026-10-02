@@ -1,0 +1,21 @@
+{
+  "name": "superlocalmemory-opencode-plugin",
+  "version": "0.1.0",
+  "description": "OpenCode V2 plugin for SuperLocalMemory V4 via the system slm binary (fail-open).",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": {
+      "import": "./src/index.js"
+    }
+  },
+  "files": [
+    "src"
+  ],
+  "peerDependencies": {
+    "@opencode/plugin": "2.0.22"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "2.0.22"
+  }
+}
