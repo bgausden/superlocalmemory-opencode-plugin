@@ -27,103 +27,18 @@ const MEMORY_NUDGE = `[MEMORY TRIGGER DETECTED]
 The user wants you to remember something. Use the superlocalmemory MCP
 tools (remember) to save it.`;
 
-// --- generic helpers (kept exported for tests) ---
+// --- retrieval module (single seam, candidate 2) ---
+// One interface for every shape the live V2 hooks actually send.
+// Private probes below; hooks and tests go through `retrieval` only.
 function isRecord(v) {
   return typeof v === "object" && v !== null;
-}
-
-function extractTextFromParts(parts) {
-  if (!Array.isArray(parts)) return "";
-  return parts
-    .map((p) => {
-      if (!isRecord(p) || p.type !== "text") return "";
-      return typeof p.text === "string" ? p.text.trim() : "";
-    })
-    .filter(Boolean)
-    .join("\n");
 }
 
 function readString(v) {
   return typeof v === "string" ? v.trim() : "";
 }
 
-export function extractPromptText(payload) {
-  if (!isRecord(payload)) return "";
-  const c = payload;
-  // V2 prompt hook passes { sessionID, prompt: { text } }; support V1 shapes too.
-  const values = [
-    c.prompt?.text,
-    c.text,
-    c.prompt,
-    c.content,
-    extractTextFromParts(c.parts),
-    c.message?.text,
-    c.message?.prompt,
-    c.message?.content,
-    extractTextFromParts(c.message?.parts),
-    c.properties?.text,
-    c.properties?.prompt,
-    extractTextFromParts(c.properties?.parts),
-    c.event?.properties?.text,
-    c.event?.properties?.prompt,
-    extractTextFromParts(c.event?.properties?.parts),
-  ];
-  return values.map(readString).find(Boolean) ?? "";
-}
-
-export function resolveSessionID(payload) {
-  if (!isRecord(payload)) return undefined;
-  const c = payload;
-  return (
-    c.sessionID ??
-    c.sessionId ??
-    c.path?.id ??
-    c.properties?.sessionID ??
-    c.event?.properties?.sessionID ??
-    c.data?.sessionID
-  );
-}
-
-export function appendPromptText(output, text) {
-  const trimmed = (text || "").trim();
-  if (!trimmed) return;
-  if (Array.isArray(output?.context)) {
-    output.context.push(trimmed);
-    return;
-  }
-  if (typeof output?.append === "function") {
-    output.append(trimmed);
-    return;
-  }
-  if (output && typeof output === "object") {
-    // V2 prompt event: output is event.prompt ({ text })
-    if (typeof output.text === "string") {
-      output.text = output.text ? `${output.text}\n\n${trimmed}` : trimmed;
-      return;
-    }
-    output.prompt = output.prompt ? `${output.prompt}\n\n${trimmed}` : trimmed;
-  }
-}
-
-async function runSlm(args, { timeout = CTX_TIMEOUT_MS } = {}) {
-  try {
-    const { stdout } = await execFileAsync(SLM_BIN, args, {
-      timeout,
-      maxBuffer: 256 * 1024,
-    });
-    return (stdout || "").trim();
-  } catch {
-    return "";
-  }
-}
-
-function truncate(s, max = MAX_CTX_CHARS) {
-  if (!s) return "";
-  if (s.length <= max) return s;
-  return s.slice(0, max) + `\n…[truncated ${s.length - max} chars]`;
-}
-
-function extractMessageText(m) {
+function messageText(m) {
   if (!isRecord(m)) return "";
   const c = m.content ?? m.parts ?? m.text;
   if (typeof c === "string") return c.trim();
@@ -141,16 +56,75 @@ function extractMessageText(m) {
   return "";
 }
 
-export function extractLastUserText(messages) {
+function lastUserText(messages) {
   if (!Array.isArray(messages)) return "";
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     if (!isRecord(m)) continue;
     if (m.role && m.role !== "user") continue;
-    const text = extractMessageText(m);
+    const text = messageText(m);
     if (text) return text;
   }
   return "";
+}
+
+export const retrieval = {
+  // Conversation text for the context hook: last user message, else a
+  // direct text payload. V1 envelope probes (properties/event/message/parts)
+  // deleted — the live SessionContext event carries messages/system.
+  text(payload) {
+    if (!isRecord(payload)) return "";
+    const fromMessages = lastUserText(payload.messages);
+    if (fromMessages) return fromMessages;
+    const c = payload;
+    const values = [c.prompt?.text, c.text, c.prompt, c.content];
+    return values.map(readString).find(Boolean) ?? "";
+  },
+  // Session identity for context + subscribe events. Live shapes carry
+  // sessionID directly or under data; V1 properties/path probes deleted.
+  sessionID(payload) {
+    if (!isRecord(payload)) return undefined;
+    return payload.sessionID ?? payload.sessionId ?? payload.data?.sessionID;
+  },
+  // File path from tool input. Live shape is the direct args object;
+  // V1 properties/event nesting deleted.
+  filePath(input) {
+    if (!isRecord(input)) return "";
+    const candidates = [
+      input?.filePath,
+      input?.path,
+      input?.file_path,
+      input?.args?.filePath,
+      input?.args?.path,
+    ];
+    for (const c of candidates) {
+      if (typeof c === "string" && c.trim()) return c.trim();
+    }
+    const nested = input?.tool_input;
+    if (isRecord(nested)) {
+      const fp = nested.file_path || nested.filePath || nested.path;
+      if (typeof fp === "string" && fp.trim()) return fp.trim();
+    }
+    return "";
+  },
+};
+
+async function runSlm(args, { timeout = CTX_TIMEOUT_MS } = {}) {
+  try {
+    const { stdout } = await execFileAsync(SLM_BIN, args, {
+      timeout,
+      maxBuffer: 256 * 1024,
+    });
+    return (stdout || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+function truncate(s, max = MAX_CTX_CHARS) {
+  if (!s) return "";
+  if (s.length <= max) return s;
+  return s.slice(0, max) + `\n…[truncated ${s.length - max} chars]`;
 }
 
 async function sessionContext(query, max = MAX_CTX_CHARS) {
@@ -178,39 +152,6 @@ function markCooldown(path) {
   try {
     writeFileSync(path, String(Date.now()));
   } catch {}
-}
-
-function extractFilePath(input) {
-  if (!isRecord(input)) return "";
-  // V2 tool hook: input is direct args object. Support V1 nesting too.
-  const candidates = [
-    input?.filePath,
-    input?.path,
-    input?.file_path,
-    input?.args?.filePath,
-    input?.args?.path,
-    input?.properties?.path,
-    input?.event?.properties?.path,
-  ];
-  for (const c of candidates) {
-    if (typeof c === "string" && c.trim()) return c.trim();
-  }
-  const toolInput = input?.tool_input;
-  if (isRecord(toolInput)) {
-    const fp = toolInput.file_path || toolInput.filePath || toolInput.path;
-    if (typeof fp === "string" && fp.trim()) return fp.trim();
-  }
-  return "";
-}
-
-function extractSessionIdFromEvent(event) {
-  if (!isRecord(event)) return undefined;
-  return (
-    event?.data?.sessionID ||
-    event?.properties?.sessionID ||
-    event?.properties?.info?.id ||
-    event?.sessionID
-  );
 }
 
 function isSessionEndEvent(event) {
@@ -259,8 +200,7 @@ export default Plugin.define({
     // Background recall: model-only system context, not echoed as user text.
     await ctx.session.hook("context", async (event) => {
       try {
-        const text =
-          extractLastUserText(event?.messages) || extractPromptText(event);
+        const text = retrieval.text(event);
         if (!text.trim()) return;
         const additions = [];
 
@@ -268,7 +208,7 @@ export default Plugin.define({
           additions.push(MEMORY_NUDGE);
         }
 
-        const sessionID = event?.sessionID || resolveSessionID(event);
+        const sessionID = event?.sessionID || retrieval.sessionID(event);
         const key = sessionID || text.slice(0, 64) || "unknown";
         const isFirst = firstSeen.claim(key);
 
@@ -294,7 +234,7 @@ export default Plugin.define({
     await ctx.tool.hook("execute.after", async (event) => {
       try {
         const tool = String(event?.tool || "").toLowerCase();
-        const fp = extractFilePath(event?.input);
+        const fp = retrieval.filePath(event?.input);
         if (!/(edit|write|create|apply_patch)/.test(tool) && !fp) return;
         if (!fp) return;
         const basename = fp.split("/").pop();
@@ -327,7 +267,7 @@ export default Plugin.define({
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
           try {
             if (!isSessionEndEvent(event)) continue;
-            const sessionID = extractSessionIdFromEvent(event);
+            const sessionID = retrieval.sessionID(event);
             let branch = "";
             let diff = "";
             try {

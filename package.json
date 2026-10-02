@@ -12,6 +12,9 @@
   "files": [
     "src"
   ],
+  "scripts": {
+    "test": "node --test test/retrieval.test.js"
+  },
   "peerDependencies": {
     "@opencode/plugin": "2.0.22"
   },
