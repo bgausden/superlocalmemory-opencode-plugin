@@ -188,6 +188,49 @@ describe("classifySlmError", () => {
       classifySlmError({ code: 1, stderr: "  boom  " }),
       { tag: "exit", code: 1, stderr: "boom" }
     );
-    assert.deepEqual(classifySlmError(null), { tag: "unknown" });
+    assert.deepEqual(classifySlmError(null), { tag: "unknown", code: "", message: "null" });
+  });
+});
+
+describe("classifySlmError edge cases", () => {
+  it("does not mistake a self-signalled child for our timeout", async () => {
+    const { classifySlmError } = await import("../src/index.js");
+    assert.deepEqual(
+      classifySlmError({ code: null, killed: false, signal: "SIGTERM" }),
+      { tag: "exit", code: "SIGTERM", stderr: "" }
+    );
+  });
+
+  it("tags buffer overflow and carries errno details", async () => {
+    const { classifySlmError } = await import("../src/index.js");
+    assert.deepEqual(
+      classifySlmError({ code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" }),
+      { tag: "overflow", limitBytes: 256 * 1024 }
+    );
+    assert.deepEqual(classifySlmError({ code: "EPERM" }), {
+      tag: "spawn",
+      code: "EPERM",
+    });
+  });
+
+  it("unknown carries whatever the runtime said", async () => {
+    const { classifySlmError } = await import("../src/index.js");
+    const r = classifySlmError({ code: "ERR_OUT_OF_RANGE" });
+    assert.equal(r.tag, "unknown");
+    assert.equal(r.code, "ERR_OUT_OF_RANGE");
+  });
+});
+
+describe("createGatewayMonitor", () => {
+  it("notifies once at threshold, re-arms on success", async () => {
+    const { createGatewayMonitor } = await import("../src/index.js");
+    const m = createGatewayMonitor({ threshold: 3 });
+    assert.equal(m.failure({ tag: "spawn" }), false);
+    assert.equal(m.failure({ tag: "spawn" }), false);
+    assert.equal(m.failure({ tag: "timeout" }), true);
+    assert.equal(m.failure({ tag: "timeout" }), false);
+    m.success();
+    assert.equal(m.failure({ tag: "exit" }), false);
+    assert.deepEqual(m.status().lastError, { tag: "exit" });
   });
 });

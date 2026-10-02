@@ -120,25 +120,67 @@ export const retrieval = {
 };
 
 // --- slm gateway errors (tagged, explicit fail-open) ---
-// Every slm subprocess failure is classified, never swallowed to "". Callers
-// check `ok` and degrade deliberately — the shape an Effect migration would
-// lift into the error channel (Effect<A, SliError>) and close with catchAll
-// at the boundary, as the effect flavor's `Effect<void, never, R>` requires.
+// Every slm subprocess failure is classified, never swallowed to "". The
+// recall path branches on the classification (degraded-mode notice below);
+// the fire-and-forget and git-probe paths drop explicitly. An Effect
+// migration would lift these tags into the error channel — note the effect
+// flavor is a separate entry point (`effect`, not `setup`) whose
+// `Effect<void, never, R>` signature closes that channel with Scope
+// finalizers instead of our AbortController cleanup.
 const slmBin = () => process.env.SLM_BIN || "slm";
 
 export function classifySlmError(err, { timeout = CTX_TIMEOUT_MS } = {}) {
-  if (isRecord(err) && (err.killed || err.signal === "SIGTERM")) {
+  // Node sets killed:true only when IT killed the child (our timeout path —
+  // no killSignal override or AbortSignal in play). A self-signalled child
+  // has killed:false and must not be reported as our budget expiring.
+  if (isRecord(err) && err.killed === true) {
     return { tag: "timeout", timeoutMs: timeout };
   }
-  if (isRecord(err) && (err.code === "ENOENT" || err.code === "EACCES")) {
+  if (isRecord(err) && (err.code === "ENOENT" || err.code === "EACCES" || err.code === "EPERM")) {
     return { tag: "spawn", code: err.code };
+  }
+  if (isRecord(err) && err.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
+    return { tag: "overflow", limitBytes: 256 * 1024 };
   }
   if (isRecord(err) && (typeof err.code === "number" || typeof err.signal === "string")) {
     const stderr =
       typeof err.stderr === "string" ? err.stderr.trim().slice(0, 500) : "";
     return { tag: "exit", code: err.code ?? err.signal, stderr };
   }
-  return { tag: "unknown" };
+  // Never a black hole: carry whatever the runtime said.
+  const message = (() => {
+    try {
+      const m = isRecord(err) ? err.message : err;
+      return typeof m === "string" ? m.slice(0, 200) : String(m).slice(0, 200);
+    } catch {
+      return "";
+    }
+  })();
+  const code = isRecord(err) && err.code !== undefined ? String(err.code) : "";
+  return { tag: "unknown", code, message };
+}
+
+// Degraded-mode monitor: repeated recall failures surface ONE short system
+// line so dead-binary is distinguishable from no-memories at the model
+// boundary, then stay quiet until a success re-arms. Pure factory, tested.
+export function createGatewayMonitor({ threshold = 3 } = {}) {
+  let consecutive = 0;
+  let lastError;
+  return {
+    failure(error) {
+      consecutive += 1;
+      lastError = error;
+      if (consecutive === threshold) return true;
+      return false;
+    },
+    success() {
+      consecutive = 0;
+      lastError = undefined;
+    },
+    status() {
+      return { consecutive, lastError };
+    },
+  };
 }
 
 async function runSlmStrict(args, { timeout = CTX_TIMEOUT_MS } = {}) {
@@ -285,6 +327,12 @@ export default Plugin.define({
     })();
 
     // Background recall: model-only system context, not echoed as user text.
+    // Gateway failures feed the degraded-mode monitor: after `threshold`
+    // consecutive recall failures one short notice is injected so a dead
+    // backend is distinguishable from genuinely-empty memory, then silence
+    // until a success re-arms. Only recall-path failures count — background
+    // writes stay fire-and-forget by design.
+    const gateway = createGatewayMonitor();
     await ctx.session.hook("context", async (event) => {
       try {
         const text = retrieval.text(event);
@@ -300,9 +348,16 @@ export default Plugin.define({
         const isFirst = firstSeen.claim(key);
 
         const r = await sessionContext(text);
-        if (r.ok && r.text) {
+        if (r.ok) {
+          gateway.success();
+          if (r.text) {
+            additions.push(
+              `<slm-memory status="background">\nFor model use only; do not quote verbatim unless directly relevant.\n\n${r.text}\n</slm-memory>`
+            );
+          }
+        } else if (gateway.failure(r.error)) {
           additions.push(
-            `<slm-memory status="background">\nFor model use only; do not quote verbatim unless directly relevant.\n\n${r.text}\n</slm-memory>`
+            `SLM memory backend unavailable (${r.error.tag}); continuing without recalled context.`
           );
         }
         if (isFirst) {
@@ -340,7 +395,14 @@ export default Plugin.define({
     await ctx.session.hook("compaction", async (event) => {
       try {
         const r = await sessionContext(projectName, MAX_COMPACT_CTX_CHARS);
-        if (!r.ok || !r.text) return;
+        // Explicit drop, no notice: compaction must never gain new failure
+        // text, and the recall-path monitor already counts the failure.
+        if (!r.ok) {
+          gateway.failure(r.error);
+          return;
+        }
+        gateway.success();
+        if (!r.text) return;
         const prompt =
           `[SESSION COMPACTION — SLM PROJECT KNOWLEDGE]\nPreserve task status, decisions, files touched, and blockers.\n\n${r.text}`;
         if (Array.isArray(event?.system)) {
@@ -370,6 +432,9 @@ export default Plugin.define({
             let branch = "";
             let diff = "";
             let log = [];
+            // Deliberately unclassified: these probes degrade to absent
+            // summary sections (a missing branch: line is still a true
+            // summary), so classification would add branches no caller reads.
             try {
               const [b, d, l] = await Promise.all([
                 execFileAsync("git", ["-C", projectDir, "branch", "--show-current"], {
