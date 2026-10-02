@@ -29,7 +29,7 @@ Requires `@opencode/plugin 2.0.22` (see `package.json`) and `slm` on
 
 ## Behaviour
 
-- `session.prompt` hook: keyword nudge + `slm session-context` + first-message init hint.
+- `session.context` hook: keyword nudge + `slm session-context` + first-message init hint into `event.system` (model-only background, not echoed as user text).
 - `tool.execute.after` hook: cooldown-gated `slm remember` on file edits.
 - `session.compaction` hook: inject SLM project knowledge into compaction.
 - `event.subscribe`: session end summary via `slm remember` with git branch/diff.
