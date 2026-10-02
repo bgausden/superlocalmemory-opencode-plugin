@@ -241,20 +241,20 @@ export default Plugin.define({
       ctx.location?.directory || ctx.location?.project?.directory || process.cwd();
     const projectName =
       String(projectDir).split("/").filter(Boolean).pop() || "general";
-    const injectedSessions = new Set();
-
-    // Prompt hook stays lightweight on purpose: the recalled SLM text is NOT
-    // appended to event.prompt.text anymore (that echoes prominently as the
-    // user's own message and is persisted). It only tracks first-seen
-    // sessions; the actual recall is injected via the "context" hook below
-    // into event.system, which is model-only background like thinking output.
-    await ctx.session.hook("prompt", async (event) => {
-      try {
-        const sessionID = event?.sessionID || resolveSessionID(event);
-        const key = sessionID || readString(event?.prompt?.text).slice(0, 64) || "unknown";
-        if (!injectedSessions.has(key)) injectedSessions.add(key);
-      } catch {}
-    });
+    // Single injection module owning the first-seen seam (candidate 1).
+    // One interface, one place to test: claim() returns true exactly once
+    // per key. Only the context hook claims; no prompt hook pre-marking.
+    const firstSeen = (() => {
+      const seen = new Set();
+      return {
+        claim(key) {
+          const k = key || "unknown";
+          if (seen.has(k)) return false;
+          seen.add(k);
+          return true;
+        },
+      };
+    })();
 
     // Background recall: model-only system context, not echoed as user text.
     await ctx.session.hook("context", async (event) => {
@@ -270,8 +270,7 @@ export default Plugin.define({
 
         const sessionID = event?.sessionID || resolveSessionID(event);
         const key = sessionID || text.slice(0, 64) || "unknown";
-        const isFirst = !injectedSessions.has(key);
-        if (isFirst) injectedSessions.add(key);
+        const isFirst = firstSeen.claim(key);
 
         const slmCtx = await sessionContext(text);
         if (slmCtx) {
