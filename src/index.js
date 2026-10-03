@@ -326,6 +326,12 @@ export default Plugin.define({
       };
     })();
 
+    // Hook registrations are scoped to the plugin's lifetime: the host
+    // disposes them on unload (see @opencode/plugin adapter: "Hook
+    // registrations created during the async `setup` attach to the plugin's
+    // scope, so unloading the plugin disposes them"). The returned
+    // registrations are therefore intentionally not retained — only the
+    // ctx.event.subscribe loop below needs manual cleanup via controller.
     // Background recall: model-only system context, not echoed as user text.
     // Gateway failures feed the degraded-mode monitor: after `threshold`
     // consecutive recall failures one short notice is injected so a dead
