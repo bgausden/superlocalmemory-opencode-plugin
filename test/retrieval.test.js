@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { retrieval, patchPaths, isSessionEndEvent, createTouchLog, formatEndSummary } from "../src/index.js";
+import { retrieval, patchPaths, isSessionEndEvent, createTouchLog, formatEndSummary, endSummaryHash, createEndSummaryGate, END_SUMMARY_MIN_INTERVAL_MS } from "../src/index.js";
 
 describe("retrieval.text", () => {
   it("returns the last user message, skipping system/assistant/tool", () => {
@@ -300,5 +300,59 @@ describe("runSlmStrict exec adapter", () => {
       ok: false,
       error: { tag: "overflow", limitBytes: 256 * 1024 },
     });
+  });
+});
+
+describe("createTouchLog.peek", () => {
+  it("reads without clearing, take still drains", async () => {
+    const { createTouchLog } = await import("../src/index.js");
+    const log = createTouchLog();
+    log.touch("s1", ["a.ts"]);
+    assert.deepEqual(log.peek("s1"), ["a.ts"]);
+    assert.deepEqual(log.peek("s1"), ["a.ts"]);
+    assert.deepEqual(log.take("s1"), ["a.ts"]);
+    assert.deepEqual(log.peek("s1"), []);
+    assert.deepEqual(log.peek("missing"), []);
+  });
+});
+
+describe("endSummaryHash", () => {
+  it("is stable for identical payloads, differs on change", async () => {
+    const { endSummaryHash } = await import("../src/index.js");
+    const a = endSummaryHash({ branch: "main", files: ["x.ts"], diff: "", commits: [] });
+    const b = endSummaryHash({ branch: "main", files: ["x.ts"], diff: "", commits: [] });
+    const c = endSummaryHash({ branch: "main", files: ["x.ts", "y.ts"], diff: "", commits: [] });
+    assert.equal(a, b);
+    assert.notEqual(a, c);
+  });
+});
+
+describe("createEndSummaryGate", () => {
+  it("writes first, then blocks too-soon and unchanged, passes on changed+aged", async () => {
+    const { createEndSummaryGate } = await import("../src/index.js");
+    const gate = createEndSummaryGate({ minIntervalMs: 15 * 60 * 1000 });
+    const h1 = "hash-1";
+    const h2 = "hash-2";
+    assert.equal(gate.shouldWrite("k", h1, 0), true);
+    gate.markWritten("k", h1, 0);
+    // Too soon even with changed content.
+    assert.equal(gate.shouldWrite("k", h2, 60 * 1000), false);
+    // Aged but unchanged.
+    assert.equal(gate.shouldWrite("k", h1, 16 * 60 * 1000), false);
+    // Aged and changed.
+    assert.equal(gate.shouldWrite("k", h2, 16 * 60 * 1000), true);
+  });
+
+  it("keys are independent and unknown-safe", async () => {
+    const { createEndSummaryGate } = await import("../src/index.js");
+    const gate = createEndSummaryGate({ minIntervalMs: 1000 });
+    gate.markWritten("a", "h", 0);
+    assert.equal(gate.shouldWrite("b", "h", 500), true);
+    assert.equal(gate.shouldWrite("", "h", 500), true);
+  });
+
+  it("default interval is 15 minutes", async () => {
+    const { END_SUMMARY_MIN_INTERVAL_MS } = await import("../src/index.js");
+    assert.equal(END_SUMMARY_MIN_INTERVAL_MS, 15 * 60 * 1000);
   });
 });
