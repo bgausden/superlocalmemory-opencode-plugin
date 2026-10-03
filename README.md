@@ -1,5 +1,11 @@
 # superlocalmemory-opencode-plugin
 
+## Prerequisites
+
+The only supported deployment is onto a host with SLM installed and the
+`slm` binary on `PATH`. Without it, the plugin loads but memory features do
+nothing. `SLM_BIN` overrides the binary name if it lives elsewhere.
+
 OpenCode V2 plugin for SuperLocalMemory V4. No bundled SLM — all memory
 access shells out to the system `slm` binary on `PATH`. Fail-open: any
 error returns silently so OpenCode never breaks if SLM is down.
