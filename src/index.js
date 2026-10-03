@@ -183,9 +183,9 @@ export function createGatewayMonitor({ threshold = 3 } = {}) {
   };
 }
 
-async function runSlmStrict(args, { timeout = CTX_TIMEOUT_MS } = {}) {
+export async function runSlmStrict(args, { timeout = CTX_TIMEOUT_MS, exec = execFileAsync } = {}) {
   try {
-    const { stdout } = await execFileAsync(slmBin(), args, {
+    const { stdout } = await exec(slmBin(), args, {
       timeout,
       maxBuffer: 256 * 1024,
     });
