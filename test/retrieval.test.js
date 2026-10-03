@@ -247,8 +247,20 @@ describe("runSlmStrict exec adapter", () => {
     assert.deepEqual(r, { ok: true, stdout: "hello" });
     assert.equal(seen.file, process.env.SLM_BIN || "slm");
     assert.deepEqual(seen.args, ["session-context", "q"]);
-    assert.equal(seen.opts.timeout, 123);
-    assert.equal(seen.opts.maxBuffer, 256 * 1024);
+    assert.deepEqual(seen.opts, { timeout: 123, maxBuffer: 256 * 1024 });
+  });
+
+  it("production default shells out for real", async () => {
+    const { runSlmStrict } = await import("../src/index.js");
+    const prev = process.env.SLM_BIN;
+    process.env.SLM_BIN = "/bin/echo";
+    try {
+      const r = await runSlmStrict(["hello"], { timeout: 5000 });
+      assert.deepEqual(r, { ok: true, stdout: "hello" });
+    } finally {
+      if (prev === undefined) delete process.env.SLM_BIN;
+      else process.env.SLM_BIN = prev;
+    }
   });
 
   it("maps timeout rejection to the timeout tag", async () => {
