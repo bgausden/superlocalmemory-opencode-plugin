@@ -272,6 +272,9 @@ export function createTouchLog() {
       touched.delete(key);
       return list;
     },
+    peek(key) {
+      return [...(touched.get(key) || [])];
+    },
   };
 }
 
@@ -302,6 +305,61 @@ export function formatEndSummary({ projectName, at, branch, files, diff, session
     lines.push(`recent: ${c.slice(0, MAX_COMMIT_SUBJECT)}`);
   }
   return lines.join(" | ");
+}
+
+// --- end-summary write gate (token-spend throttle) ---
+// The daemon bills cloud LLM per remembered fact (enrichment +
+// disambiguation + summaries), so timestamp-only and duplicate summaries are
+// pure spend. Three guards, all plugin-side (no SLM fork):
+// 1. Writer rule: only a project with touched files writes. This stops the
+//    observed N-project fan-out where every idle project echoes the same
+//    session once a minute. It subsumes the empty-summary skip (no files +
+//    no diff + no commits) since files-empty always skips.
+// 2. Change gate: skip when the files/diff/commits/branch hash matches the
+//    last write for this key.
+// 3. Min interval: skip until END_SUMMARY_MIN_INTERVAL_MS has passed since
+//    the last write for this key.
+// Skipped turns cost nothing and lose nothing: the caller only peek()s
+// touches and take()s on write, so skipped content accumulates into the
+// next write.
+// Write-vs-ack semantics: the caller markWritten()s synchronously when it
+// decides to write, BEFORE the fire-and-forget remember() resolves (it is
+// never awaited by design). A failed write therefore still advances the
+// throttle. That is correct for spend-gating — a struggling daemon must not
+// cause a retry storm — but it means a daemon outage silences retries for
+// this key until the min interval passes AND content changes.
+// Pure factory, tested.
+export function parseEndSummaryMinIntervalMs(raw, fallback = 15 * 60 * 1000) {
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return fallback;
+  return n; // 0 disables the min-interval check; the change gate still applies.
+}
+export const END_SUMMARY_MIN_INTERVAL_MS = parseEndSummaryMinIntervalMs(
+  process.env.SLM_END_SUMMARY_MIN_INTERVAL_MS
+);
+
+export function endSummaryHash({ branch = "", files = [], diff = "", commits = [] } = {}) {
+  return JSON.stringify({ branch, files, diff, commits });
+}
+
+export function createEndSummaryGate({ minIntervalMs = END_SUMMARY_MIN_INTERVAL_MS, maxKeys = 100 } = {}) {
+  const seen = new Map();
+  return {
+    shouldWrite(key, hash, now = Date.now()) {
+      const k = key || "unknown";
+      const last = seen.get(k);
+      if (!last) return true;
+      if (now - last.at < minIntervalMs) return false;
+      if (last.hash === hash) return false;
+      return true;
+    },
+    markWritten(key, hash, now = Date.now()) {
+      const k = key || "unknown";
+      if (seen.size > maxKeys) seen.clear();
+      seen.set(k, { at: now, hash });
+    },
+  };
 }
 
 export default Plugin.define({
@@ -423,8 +481,13 @@ export default Plugin.define({
     // V2 is ctx.event.subscribe(). session.idle and session.status/idle both
     // fire for the same turn, so the short guard window collapses the
     // duplicate while real turns (model round-trips apart) pass through.
-    // Pruned on write: one entry per recently-ended session.
-    const endSummaries = new Map();
+    // Write gate (token-spend throttle): only the project(s) with touched
+    // files write, only on changed content, at most once per
+    // END_SUMMARY_MIN_INTERVAL_MS per key. Turns only peek() touches and
+    // take() on write, so skips accumulate instead of dropping. Pruned on
+    // write: one entry per recently-ended session.
+    const endGate = createEndSummaryGate();
+    const endDedupeAt = new Map();
     const controller = new AbortController();
     void (async () => {
       try {
@@ -433,10 +496,19 @@ export default Plugin.define({
             if (!isSessionEndEvent(event)) continue;
             const sessionID = retrieval.sessionID(event);
             const key = sessionID || projectDir;
-            const last = endSummaries.get(key) || 0;
-            if (Date.now() - last < END_SUMMARY_DEDUPE_MS) continue;
-            if (endSummaries.size > 100) endSummaries.clear();
-            const files = touches.take(sessionID || "");
+            // Short duplicate-event collapse first (cheap, no subprocesses,
+            // touches preserved — take() is not called on this path).
+            const lastDedupe = endDedupeAt.get(key) || 0;
+            if (Date.now() - lastDedupe < END_SUMMARY_DEDUPE_MS) continue;
+            endDedupeAt.set(key, Date.now());
+            if (endDedupeAt.size > 100) endDedupeAt.clear();
+            const files = touches.peek(sessionID || "");
+            // Guard 1 (writer rule + empty skip): no touched files here means
+            // this project did nothing this turn — stay silent without even
+            // paying for the three git probes below. This kills the observed
+            // once-a-minute timestamp-only fan-out across idle projects.
+            // peek() (not take()) so skipped touches stay queued.
+            if (files.length === 0) continue;
             let branch = "";
             let diff = "";
             let log = [];
@@ -465,16 +537,27 @@ export default Plugin.define({
               diff = d;
               log = l;
             } catch {}
+            // Guards 2+3 (change gate + min interval): skip unchanged or
+            // too-soon summaries. Touches were only peeked, so they stay
+            // queued and accumulate into the next write.
+            const hash = endSummaryHash({ branch, files, diff, commits: log });
+            if (!endGate.shouldWrite(key, hash)) continue;
+            // Drain only on write so a skipped turn loses nothing.
+            const drained = touches.take(sessionID || "");
             const summary = formatEndSummary({
               projectName,
               at: localTimestamp(),
               branch,
-              files,
+              files: drained.length > 0 ? drained : files,
               diff,
               sessionID,
               commits: log,
             });
-            endSummaries.set(key, Date.now());
+            endGate.markWritten(key, hash);
+            // Marked BEFORE remember() resolves (fire-and-forget, never
+            // awaited): a failed write still advances the throttle, so a
+            // daemon outage silences retries for this key until the min
+            // interval passes and content changes. Deliberate spend-gating.
             remember(summary, "opencode-session-stop").catch(() => {});
           } catch {}
         }
