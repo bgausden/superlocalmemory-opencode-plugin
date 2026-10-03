@@ -333,6 +333,14 @@ export default Plugin.define({
     // until a success re-arms. Only recall-path failures count — background
     // writes stay fire-and-forget by design.
     const gateway = createGatewayMonitor();
+    // Hook registrations are scoped to the plugin's lifetime: the host
+    // disposes them on unload (see @opencode/plugin adapter: "Hook
+    // registrations created during the async `setup` attach to the plugin's
+    // scope, so unloading the plugin disposes them"). The returned
+    // registrations are therefore intentionally not retained. The cleanup
+    // returned from setup also aborts the event-subscribe controller — the
+    // host would close that iterator on unload anyway, but prompt teardown
+    // stops our loop without waiting for it.
     await ctx.session.hook("context", async (event) => {
       try {
         const text = retrieval.text(event);
