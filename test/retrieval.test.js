@@ -234,3 +234,59 @@ describe("createGatewayMonitor", () => {
     assert.deepEqual(m.status().lastError, { tag: "exit" });
   });
 });
+
+describe("runSlmStrict exec adapter", () => {
+  it("trims success stdout and passes through file/args/opts", async () => {
+    const { runSlmStrict } = await import("../src/index.js");
+    let seen;
+    const fakeExec = async (file, args, opts) => {
+      seen = { file, args, opts };
+      return { stdout: "  hello  \n", stderr: "" };
+    };
+    const r = await runSlmStrict(["session-context", "q"], { timeout: 123, exec: fakeExec });
+    assert.deepEqual(r, { ok: true, stdout: "hello" });
+    assert.equal(seen.file, process.env.SLM_BIN || "slm");
+    assert.deepEqual(seen.args, ["session-context", "q"]);
+    assert.equal(seen.opts.timeout, 123);
+    assert.equal(seen.opts.maxBuffer, 256 * 1024);
+  });
+
+  it("maps timeout rejection to the timeout tag", async () => {
+    const { runSlmStrict } = await import("../src/index.js");
+    const fakeExec = async () => {
+      throw { killed: true };
+    };
+    const r = await runSlmStrict(["session-context", "q"], { timeout: 5, exec: fakeExec });
+    assert.deepEqual(r, { ok: false, error: { tag: "timeout", timeoutMs: 5 } });
+  });
+
+  it("maps ENOENT rejection to the spawn tag", async () => {
+    const { runSlmStrict } = await import("../src/index.js");
+    const fakeExec = async () => {
+      throw { code: "ENOENT" };
+    };
+    const r = await runSlmStrict(["session-context", "q"], { exec: fakeExec });
+    assert.deepEqual(r, { ok: false, error: { tag: "spawn", code: "ENOENT" } });
+  });
+
+  it("maps non-zero exit with stderr to the exit tag", async () => {
+    const { runSlmStrict } = await import("../src/index.js");
+    const fakeExec = async () => {
+      throw { code: 1, stderr: "  boom  " };
+    };
+    const r = await runSlmStrict(["session-context", "q"], { exec: fakeExec });
+    assert.deepEqual(r, { ok: false, error: { tag: "exit", code: 1, stderr: "boom" } });
+  });
+
+  it("maps maxBuffer overflow code to the overflow tag", async () => {
+    const { runSlmStrict } = await import("../src/index.js");
+    const fakeExec = async () => {
+      throw { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" };
+    };
+    const r = await runSlmStrict(["session-context", "q"], { exec: fakeExec });
+    assert.deepEqual(r, {
+      ok: false,
+      error: { tag: "overflow", limitBytes: 256 * 1024 },
+    });
+  });
+});
