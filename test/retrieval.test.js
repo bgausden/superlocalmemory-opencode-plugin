@@ -356,3 +356,29 @@ describe("createEndSummaryGate", () => {
     assert.equal(END_SUMMARY_MIN_INTERVAL_MS, 15 * 60 * 1000);
   });
 });
+
+describe("parseEndSummaryMinIntervalMs", () => {
+  it("defaults when unset/empty/garbage, honors 0 as disable", async () => {
+    const { parseEndSummaryMinIntervalMs } = await import("../src/index.js");
+    const dflt = 15 * 60 * 1000;
+    assert.equal(parseEndSummaryMinIntervalMs(undefined), dflt);
+    assert.equal(parseEndSummaryMinIntervalMs(""), dflt);
+    assert.equal(parseEndSummaryMinIntervalMs("abc"), dflt);
+    assert.equal(parseEndSummaryMinIntervalMs("-5"), dflt);
+    assert.equal(parseEndSummaryMinIntervalMs("0"), 0);
+    assert.equal(parseEndSummaryMinIntervalMs("60000"), 60000);
+  });
+});
+
+describe("createEndSummaryGate with minIntervalMs 0", () => {
+  it("disables the interval check but keeps the change gate", async () => {
+    const { createEndSummaryGate } = await import("../src/index.js");
+    const gate = createEndSummaryGate({ minIntervalMs: 0 });
+    gate.markWritten("k", "h1", 1000);
+    // Changed content writes immediately (no interval to wait out).
+    assert.equal(gate.shouldWrite("k", "h2", 1000), true);
+    gate.markWritten("k", "h2", 1000);
+    // Identical content still blocked by the change gate.
+    assert.equal(gate.shouldWrite("k", "h2", 1000), false);
+  });
+});

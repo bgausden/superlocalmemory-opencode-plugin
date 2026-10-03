@@ -321,9 +321,23 @@ export function formatEndSummary({ projectName, at, branch, files, diff, session
 //    the last write for this key.
 // Skipped turns cost nothing and lose nothing: the caller only peek()s
 // touches and take()s on write, so skipped content accumulates into the
-// next write. Pure factory, tested.
-export const END_SUMMARY_MIN_INTERVAL_MS =
-  Number(process.env.SLM_END_SUMMARY_MIN_INTERVAL_MS) || 15 * 60 * 1000;
+// next write.
+// Write-vs-ack semantics: the caller markWritten()s synchronously when it
+// decides to write, BEFORE the fire-and-forget remember() resolves (it is
+// never awaited by design). A failed write therefore still advances the
+// throttle. That is correct for spend-gating — a struggling daemon must not
+// cause a retry storm — but it means a daemon outage silences retries for
+// this key until the min interval passes AND content changes.
+// Pure factory, tested.
+export function parseEndSummaryMinIntervalMs(raw, fallback = 15 * 60 * 1000) {
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return fallback;
+  return n; // 0 disables the min-interval check; the change gate still applies.
+}
+export const END_SUMMARY_MIN_INTERVAL_MS = parseEndSummaryMinIntervalMs(
+  process.env.SLM_END_SUMMARY_MIN_INTERVAL_MS
+);
 
 export function endSummaryHash({ branch = "", files = [], diff = "", commits = [] } = {}) {
   return JSON.stringify({ branch, files, diff, commits });
@@ -540,6 +554,10 @@ export default Plugin.define({
               commits: log,
             });
             endGate.markWritten(key, hash);
+            // Marked BEFORE remember() resolves (fire-and-forget, never
+            // awaited): a failed write still advances the throttle, so a
+            // daemon outage silences retries for this key until the min
+            // interval passes and content changes. Deliberate spend-gating.
             remember(summary, "opencode-session-stop").catch(() => {});
           } catch {}
         }
